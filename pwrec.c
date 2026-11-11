@@ -26,6 +26,8 @@
 #include <libavutil/parseutils.h>
 #include <libavutil/pixdesc.h>
 
+#include "pwrec_gpu.h"
+
 extern char **environ;
 
 #define VIDEO_TB_DEN 1000000
@@ -44,27 +46,45 @@ static struct {
 	int verbose;
 	char **enc_args;
 	int n_enc_args;
+	int custom_args;
+	int custom_video;
+	int cpu;
+	const char *gpu_codec;
+	AVDictionary *gpu_opts;
 } opt = {
 	.ffmpeg = "ffmpeg",
+	.gpu_codec = "hevc_nvenc",
 	.rate = 48000,
 	.channels = 2,
 	.queue_mb = 4096,
 	.nominal_fps = { 60, 1 },
 };
 
-static const char *default_enc_args[] = {
+static const char *default_video_args[] = {
 	"-c:v", "hevc_nvenc", "-b:v", "30M", "-pix_fmt", "yuv444p",
 	"-vf", "scale=out_color_matrix=bt709:out_range=tv,"
 	       "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
+	NULL,
+};
+
+static const char *default_audio_args[] = {
 	"-c:a", "flac", "-compression_level", "12",
 	"-af", "aresample=async=1:first_pts=0",
+	NULL,
+};
+
+static const char *default_gpu_opts[] = {
+	"b", "30M",
+	"preset", "p4",
+	"rgb_mode", "yuv444",
 	NULL,
 };
 
 struct pkt {
 	struct pkt *next;
 	int stream;
-	int64_t pts;
+	int64_t pts, dts;
+	int flags;
 	size_t size;
 	uint8_t data[];
 };
@@ -141,6 +161,8 @@ static void q_close(void)
 
 
 static atomic_int quit;
+static atomic_int gpu_ready;
+static int gpu_ok;
 static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t sync_cond = PTHREAD_COND_INITIALIZER;
 
@@ -149,6 +171,7 @@ static struct {
 	enum AVPixelFormat pix_fmt;
 	int width, height, bpp;
 	uint32_t spa_format;
+	int dmabuf;
 
 	int audio_ready;
 	int started;
@@ -206,6 +229,7 @@ static void video_param_changed(void *data, uint32_t id, const struct spa_pod *p
 		return;
 	if (spa_format_video_raw_parse(param, &info) < 0)
 		return;
+	int dmabuf = spa_pod_find_prop(param, NULL, SPA_FORMAT_VIDEO_modifier) != NULL;
 
 	enum AVPixelFormat pf;
 	switch (info.format) {
@@ -222,7 +246,7 @@ static void video_param_changed(void *data, uint32_t id, const struct spa_pod *p
 	if (st.have_format) {
 		if (info.size.width != (uint32_t)st.width ||
 		    info.size.height != (uint32_t)st.height ||
-		    info.format != st.spa_format) {
+		    info.format != st.spa_format || dmabuf != st.dmabuf) {
 			st.format_changes++;
 			fprintf(stderr, "\npwrec: video format changed mid-recording "
 				"(%ux%u) - stopping\n", info.size.width, info.size.height);
@@ -234,22 +258,59 @@ static void video_param_changed(void *data, uint32_t id, const struct spa_pod *p
 		st.pix_fmt = pf;
 		st.spa_format = info.format;
 		st.bpp = 4;
+		st.dmabuf = dmabuf;
 		st.have_format = 1;
-		fprintf(stderr, "pwrec: video %dx%d %s, producer max %u/%u fps\n",
+		fprintf(stderr, "pwrec: video %dx%d %s via %s, producer max %u/%u fps\n",
 			st.width, st.height, av_get_pix_fmt_name(pf),
+			dmabuf ? "dmabuf (gpu)" : "shared memory (cpu)",
 			info.max_framerate.num, info.max_framerate.denom);
 	}
 	pthread_cond_broadcast(&sync_cond);
 	pthread_mutex_unlock(&sync_lock);
 
-	uint8_t buf[256];
+	uint8_t buf[512];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-	const struct spa_pod *params[1];
+	const struct spa_pod *params[2];
 	params[0] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
 		SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
 		SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
-	pw_stream_update_params(vid.stream, params, 1);
+	params[1] = spa_pod_builder_add_object(&b,
+		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(dmabuf
+			? (1 << SPA_DATA_DmaBuf)
+			: (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)));
+	pw_stream_update_params(vid.stream, params, 2);
+}
+
+static void video_add_buffer(void *data, struct pw_buffer *b)
+{
+	struct spa_data *d = &b->buffer->datas[0];
+	if (d->type != SPA_DATA_DmaBuf || !gpu_ok)
+		return;
+	b->user_data = gpu_import((int)d->fd, d->maxsize);
+	if (!b->user_data)
+		fprintf(stderr, "pwrec: failed to import dmabuf\n");
+}
+
+static void video_remove_buffer(void *data, struct pw_buffer *b)
+{
+	gpu_release(b->user_data);
+	b->user_data = NULL;
+}
+
+static void emit_video_packet(AVPacket *ap)
+{
+	struct pkt *p = malloc(sizeof(*p) + ap->size);
+	if (!p)
+		return;
+	p->stream = 0;
+	p->pts = ap->pts;
+	p->dts = ap->dts;
+	p->flags = ap->flags;
+	p->size = ap->size;
+	memcpy(p->data, ap->data, ap->size);
+	q_push(p);
 }
 
 static void video_process(void *data)
@@ -261,8 +322,11 @@ static void video_process(void *data)
 	struct spa_data *d = &buf->datas[0];
 	int64_t now_mono = mono_ns();
 
-	if (!st.have_format || !d->data || !d->chunk ||
+	int gpu = d->type == SPA_DATA_DmaBuf;
+	if (!st.have_format || !d->chunk ||
 	    (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) || d->chunk->size == 0)
+		goto done;
+	if (gpu ? (!b->user_data || !atomic_load(&gpu_ready)) : !d->data)
 		goto done;
 
 	struct spa_meta_header *h = spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(*h));
@@ -319,6 +383,12 @@ static void video_process(void *data)
 	size_t row = (size_t)st.width * st.bpp;
 	size_t size = row * st.height;
 	uint32_t stride = d->chunk->stride ? (uint32_t)d->chunk->stride : row;
+
+	if (gpu) {
+		gpu_encode(b->user_data, d->chunk->offset, stride, pts, emit_video_packet);
+		goto done;
+	}
+
 	uint32_t off = d->chunk->offset % d->maxsize;
 	if ((uint64_t)off + (uint64_t)stride * (st.height - 1) + row > d->maxsize) {
 		fprintf(stderr, "pwrec: short video buffer, skipping\n");
@@ -329,7 +399,8 @@ static void video_process(void *data)
 	if (!p)
 		goto done;
 	p->stream = 0;
-	p->pts = pts;
+	p->pts = p->dts = pts;
+	p->flags = AV_PKT_FLAG_KEY;
 	p->size = size;
 	const uint8_t *src = (const uint8_t *)d->data + off;
 	if (stride == row) {
@@ -348,6 +419,8 @@ done:
 static const struct pw_stream_events video_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.param_changed = video_param_changed,
+	.add_buffer = video_add_buffer,
+	.remove_buffer = video_remove_buffer,
 	.process = video_process,
 };
 
@@ -414,7 +487,8 @@ static void audio_process(void *data)
 	struct pkt *p = malloc(sizeof(*p) + bytes);
 	if (p) {
 		p->stream = 1;
-		p->pts = pts;
+		p->pts = p->dts = pts;
+		p->flags = AV_PKT_FLAG_KEY;
 		p->size = bytes;
 		memcpy(p->data, (uint8_t *)d->data + off + skip * frame_size, bytes);
 		q_push(p);
@@ -481,10 +555,33 @@ static int connect_video(void)
 	pw_stream_add_listener(vid.stream, &vid.listener, &video_events, NULL);
 	pw_stream_add_listener(vid.stream, &vid_state_listener, &video_state_events, "video");
 
-	uint8_t buf[1024];
+	uint8_t buf[2048];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
-	const struct spa_pod *params[1];
-	params[0] = spa_pod_builder_add_object(&b,
+	const struct spa_pod *params[2];
+	uint32_t n = 0;
+
+	if (gpu_ok) {
+		struct spa_pod_frame f;
+		spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+		spa_pod_builder_add(&b,
+			SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+			SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(5,
+				SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_BGRx,
+				SPA_VIDEO_FORMAT_RGBA, SPA_VIDEO_FORMAT_RGBx),
+			0);
+		spa_pod_builder_prop(&b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+		spa_pod_builder_long(&b, 0); // DRM_FORMAT_MOD_LINEAR
+		spa_pod_builder_add(&b,
+			SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(
+				&SPA_RECTANGLE(1920, 1080), &SPA_RECTANGLE(1, 1), &SPA_RECTANGLE(16384, 16384)),
+			SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+				&SPA_FRACTION(0, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)),
+			0);
+		params[n++] = spa_pod_builder_pop(&b, &f);
+	}
+
+	params[n++] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
 		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
@@ -497,7 +594,7 @@ static int connect_video(void)
 			&SPA_FRACTION(0, 1), &SPA_FRACTION(0, 1), &SPA_FRACTION(1000, 1)));
 
 	int r = pw_stream_connect(vid.stream, PW_DIRECTION_INPUT, PW_ID_ANY,
-		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, 1);
+		PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS, params, n);
 	pw_thread_loop_unlock(vid.loop);
 	return r;
 }
@@ -564,7 +661,17 @@ static int ffmpeg_fd = -1;
 static AVStream *vst, *ast;
 static int mux_error;
 
-static int open_muxer(int fd)
+static AVRational video_time_base(void)
+{
+	return opt.cfr_num ? (AVRational){ opt.cfr_den, opt.cfr_num } : (AVRational){ 1, VIDEO_TB_DEN };
+}
+
+static AVRational video_frame_rate(void)
+{
+	return opt.cfr_num ? (AVRational){ opt.cfr_num, opt.cfr_den } : opt.nominal_fps;
+}
+
+static int open_muxer(int fd, AVCodecContext *enc)
 {
 	char url[32];
 	snprintf(url, sizeof(url), "pipe:%d", fd);
@@ -572,6 +679,12 @@ static int open_muxer(int fd)
 		return -1;
 
 	vst = avformat_new_stream(oc, NULL);
+	if (enc) {
+		avcodec_parameters_from_context(vst->codecpar, enc);
+		vst->time_base = video_src_tb = enc->time_base;
+		vst->avg_frame_rate = vst->r_frame_rate = enc->framerate;
+		goto video_done;
+	}
 	vst->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
 	vst->codecpar->codec_id = AV_CODEC_ID_RAWVIDEO;
 	vst->codecpar->format = st.pix_fmt;
@@ -590,6 +703,7 @@ static int open_muxer(int fd)
 		vst->time_base = video_src_tb = (AVRational){ 1, VIDEO_TB_DEN };
 		vst->avg_frame_rate = vst->r_frame_rate = opt.nominal_fps;
 	}
+video_done:
 
 	if (!opt.no_audio) {
 		ast = avformat_new_stream(oc, NULL);
@@ -620,9 +734,10 @@ static void *mux_thread(void *arg)
 			pkt->data = p->data;
 			pkt->size = p->size;
 			pkt->stream_index = s->index;
-			pkt->pts = pkt->dts = av_rescale_q(p->pts, src_tb, s->time_base);
+			pkt->pts = av_rescale_q(p->pts, src_tb, s->time_base);
+			pkt->dts = av_rescale_q(p->dts, src_tb, s->time_base);
 			pkt->duration = p->stream == 1 ? (int64_t)(p->size / (4 * opt.channels)) : 0;
-			pkt->flags = AV_PKT_FLAG_KEY;
+			pkt->flags = p->flags;
 			int r = av_write_frame(oc, pkt);
 			if (r < 0) {
 				fprintf(stderr, "\npwrec: write to ffmpeg failed: %s\n", av_err2str(r));
@@ -653,10 +768,23 @@ static pid_t spawn_ffmpeg(int *write_fd)
 	argv[n++] = "-stats";
 	argv[n++] = "-f"; argv[n++] = "nut";
 	argv[n++] = "-i"; argv[n++] = "pipe:0";
-	for (int i = 0; i < opt.n_enc_args && n < 110; i++)
-		argv[n++] = opt.enc_args[i];
-	argv[n++] = "-fps_mode"; argv[n++] = "passthrough";
-	argv[n++] = "-enc_time_base:v"; argv[n++] = "demux";
+	if (st.dmabuf) {
+		argv[n++] = "-c:v"; argv[n++] = "copy";
+	} else if (!opt.custom_video) {
+		for (int i = 0; default_video_args[i]; i++)
+			argv[n++] = default_video_args[i];
+	}
+	if (opt.custom_args) {
+		for (int i = 0; i < opt.n_enc_args && n < 110; i++)
+			argv[n++] = opt.enc_args[i];
+	} else if (!opt.no_audio) {
+		for (int i = 0; default_audio_args[i]; i++)
+			argv[n++] = default_audio_args[i];
+	}
+	if (!st.dmabuf) {
+		argv[n++] = "-fps_mode"; argv[n++] = "passthrough";
+		argv[n++] = "-enc_time_base:v"; argv[n++] = "demux";
+	}
 	argv[n++] = "-y";
 	argv[n++] = opt.output;
 	argv[n] = NULL;
@@ -692,6 +820,25 @@ static pid_t spawn_ffmpeg(int *write_fd)
 
 static void on_signal(int sig) { atomic_store(&quit, 1); }
 
+static int arg_touches_video(const char *a)
+{
+	static const char *exact[] = {
+		"-c", "-codec", "-vcodec", "-vf", "-pix_fmt", "-crf", "-qp", "-preset",
+		"-tune", "-profile", "-g", "-b", "-vb", "-filter_complex", "-lavfi", NULL,
+	};
+	static const char *prefix[] = {
+		"-c:v", "-codec:v", "-filter:v", "-b:v", "-pix_fmt:v", "-profile:v",
+		"-preset:v", "-tune:v", "-crf:v", "-qp:v", "-g:v", NULL,
+	};
+	for (int i = 0; exact[i]; i++)
+		if (strcmp(a, exact[i]) == 0)
+			return 1;
+	for (int i = 0; prefix[i]; i++)
+		if (strncmp(a, prefix[i], strlen(prefix[i])) == 0)
+			return 1;
+	return 0;
+}
+
 static void usage(FILE *f)
 {
 	fprintf(f,
@@ -715,11 +862,28 @@ static void usage(FILE *f)
 "      --ffmpeg PATH      ffmpeg binary (default: ffmpeg)\n"
 "  -v, --verbose          print the ffmpeg command line and more\n"
 "\n"
-"any args after -- replace the default encoder args, which are:\n"
-"  ");
-	for (int i = 0; default_enc_args[i]; i++)
-		fprintf(f, "%s ", default_enc_args[i]);
-	fprintf(f, "\n(-fps_mode passthrough -enc_time_base:v demux are always added.)\n");
+"video path:\n"
+"  by default pwrec asks the producer for DMA-BUFs and encodes on the GPU\n"
+"  (copy into CUDA, NVENC converts RGB to YUV itself). producers that can't\n"
+"  export DMA-BUFs fall back to the CPU path, where raw frames go to ffmpeg.\n"
+"      --cpu              always use the CPU path (implied when the args after\n"
+"                         -- set any video option, e.g. -c:v libvpx-vp9)\n"
+"      --gpu-codec NAME   GPU path encoder (default hevc_nvenc)\n"
+"      --gpu-opt K=V      GPU path encoder option, repeatable. defaults:\n"
+"                         ");
+	for (int i = 0; default_gpu_opts[i]; i += 2)
+		fprintf(f, "%s=%s ", default_gpu_opts[i], default_gpu_opts[i + 1]);
+	fprintf(f, "\n\n"
+"any args after -- replace the default ffmpeg args. on the CPU path the\n"
+"defaults are the video args followed by the audio args, on the GPU path\n"
+"video is stream copied and only the audio args apply:\n"
+"  video: ");
+	for (int i = 0; default_video_args[i]; i++)
+		fprintf(f, "%s ", default_video_args[i]);
+	fprintf(f, "\n  audio: ");
+	for (int i = 0; default_audio_args[i]; i++)
+		fprintf(f, "%s ", default_audio_args[i]);
+	fprintf(f, "\n(CPU path always adds -fps_mode passthrough -enc_time_base:v demux.)\n");
 }
 
 int main(int argc, char **argv)
@@ -734,6 +898,9 @@ int main(int argc, char **argv)
 		{ "queue-mb", required_argument, 0, 'q' },
 		{ "nominal-fps", required_argument, 0, 'N' },
 		{ "ffmpeg", required_argument, 0, 'F' },
+		{ "cpu", no_argument, 0, 'P' },
+		{ "gpu-codec", required_argument, 0, 'G' },
+		{ "gpu-opt", required_argument, 0, 'O' },
 		{ "verbose", no_argument, 0, 'v' },
 		{ "help", no_argument, 0, 'h' },
 		{ 0 },
@@ -766,6 +933,19 @@ int main(int argc, char **argv)
 			break;
 		}
 		case 'F': opt.ffmpeg = optarg; break;
+		case 'P': opt.cpu = 1; break;
+		case 'G': opt.gpu_codec = optarg; break;
+		case 'O': {
+			char *eq = strchr(optarg, '=');
+			if (!eq || eq == optarg) {
+				fprintf(stderr, "pwrec: --gpu-opt expects KEY=VALUE, got '%s'\n", optarg);
+				return 2;
+			}
+			*eq = 0;
+			av_dict_set(&opt.gpu_opts, optarg, eq + 1, 0);
+			*eq = '=';
+			break;
+		}
 		case 'v': opt.verbose = 1; break;
 		case 'h': usage(stdout); return 0;
 		default: usage(stderr); return 2;
@@ -782,13 +962,17 @@ int main(int argc, char **argv)
 	if (optind < argc) {
 		opt.enc_args = &argv[optind];
 		opt.n_enc_args = argc - optind;
-	} else {
-		opt.enc_args = (char **)default_enc_args;
-		while (default_enc_args[opt.n_enc_args])
-			opt.n_enc_args++;
-		if (opt.no_audio)
-			opt.n_enc_args -= 6;
+		opt.custom_args = 1;
+		for (int i = 0; i < opt.n_enc_args; i++)
+			opt.custom_video |= arg_touches_video(opt.enc_args[i]);
+		if (opt.custom_video && !opt.cpu) {
+			fprintf(stderr, "pwrec: video options after --, using the CPU path\n");
+			opt.cpu = 1;
+		}
 	}
+	for (int i = 0; default_gpu_opts[i]; i += 2)
+		if (!av_dict_get(opt.gpu_opts, default_gpu_opts[i], NULL, 0))
+			av_dict_set(&opt.gpu_opts, default_gpu_opts[i], default_gpu_opts[i + 1], 0);
 	if (opt.rate <= 0 || opt.channels <= 0 || opt.channels > 64 || opt.queue_mb <= 0) {
 		fprintf(stderr, "pwrec: bad option value\n");
 		return 2;
@@ -801,6 +985,12 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sa, NULL);
 
 	pw_init(&argc, &argv);
+
+	if (!opt.cpu) {
+		gpu_ok = gpu_init() == 0;
+		if (!gpu_ok)
+			fprintf(stderr, "pwrec: GPU path unavailable, using the CPU path\n");
+	}
 
 	if (connect_video() < 0 || (!opt.no_audio && connect_audio() < 0)) {
 		fprintf(stderr, "pwrec: failed to connect to PipeWire\n");
@@ -827,8 +1017,25 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	AVCodecContext *enc = NULL;
+	if (st.dmabuf) {
+		enc = gpu_encoder_open(opt.gpu_codec, st.width, st.height, st.pix_fmt,
+				       video_time_base(), video_frame_rate(), &opt.gpu_opts);
+		if (!enc) {
+			fprintf(stderr, "pwrec: failed to open the GPU encoder\n");
+			ret = 1;
+			atomic_store(&quit, 1);
+			goto out;
+		}
+		const AVDictionaryEntry *e = NULL;
+		while ((e = av_dict_iterate(opt.gpu_opts, e)))
+			fprintf(stderr, "pwrec: warning: %s doesn't know option '%s'\n",
+				opt.gpu_codec, e->key);
+		fprintf(stderr, "pwrec: encoding on the GPU with %s\n", opt.gpu_codec);
+	}
+
 	pid = spawn_ffmpeg(&ffmpeg_fd);
-	if (pid < 0 || open_muxer(ffmpeg_fd) < 0) {
+	if (pid < 0 || open_muxer(ffmpeg_fd, enc) < 0) {
 		fprintf(stderr, "pwrec: failed to start ffmpeg/muxer\n");
 		ret = 1;
 		atomic_store(&quit, 1);
@@ -836,6 +1043,8 @@ int main(int argc, char **argv)
 	}
 	pthread_create(&mt, NULL, mux_thread, NULL);
 	mux_running = 1;
+	if (enc)
+		atomic_store(&gpu_ready, 1);
 
 	while (!atomic_load(&quit)) {
 		usleep(100000);
@@ -863,6 +1072,8 @@ out:
 	fprintf(stderr, "\npwrec: stopping...\n");
 	destroy_stream(&vid);
 	destroy_stream(&aud);
+	if (mux_running && atomic_load(&gpu_ready))
+		gpu_flush(emit_video_packet);
 	if (mux_running) {
 		pthread_mutex_lock(&q.lock);
 		q.eof = 1;
@@ -905,6 +1116,9 @@ out:
 				"at the end (use VFR or a matching --cfr)\n", fabs(diff_ms),
 				diff_ms > 0 ? "more" : "less", opt.cfr_num, opt.cfr_den);
 	}
+	if (gpu_ok)
+		gpu_destroy();
+	av_dict_free(&opt.gpu_opts);
 	pw_deinit();
 	return ret;
 }

@@ -1,11 +1,13 @@
-PKGS    = libpipewire-0.3 libavformat libavcodec libavutil
+PKGS    = libpipewire-0.3 libavformat libavcodec libavutil vulkan ffnvcodec
 CFLAGS  ?= -O2 -g -Wall -Wextra -Wno-unused-parameter
 CFLAGS  += $(shell pkg-config --cflags $(PKGS))
 LDLIBS  += $(shell pkg-config --libs $(PKGS)) -lpthread -lm
 PREFIX  ?= $(HOME)/.local
 
-pwrec: pwrec.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+SRCS    = pwrec.c pwrec_gpu.c
+
+pwrec: $(SRCS) pwrec_gpu.h
+	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDLIBS) -ldl
 
 install: pwrec
 	install -Dm755 pwrec $(DESTDIR)$(PREFIX)/bin/pwrec
